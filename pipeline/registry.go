@@ -223,6 +223,35 @@ func validateAgainst(e market.Event, s Schema) (market.RejectCause, string) {
 	return market.CauseNone, ""
 }
 
+// buildShadowRegistryLocked creates an isolated registry containing every
+// already registered version (replayed in ascending order) plus the candidate
+// version enabled under the same gray-upgrade rules as a real CommitUpgrade.
+// The caller has already established (via evaluatePlan) that the candidate is
+// plan-compatible. The returned registry shares nothing with r, so a trial can
+// drive Submits through it without touching the online registry. Must be
+// called with r.mu held (read or write).
+func (r *Registry) buildShadowRegistryLocked(candidate Schema) *Registry {
+	shadow := NewRegistry()
+	versions := make([]int, 0, len(r.schemas))
+	for v := range r.schemas {
+		versions = append(versions, v)
+	}
+	sort.Ints(versions)
+	for _, v := range versions {
+		// Historical versions are replayed structurally: they were accepted
+		// once and remain immutable history, so the shadow must accept them.
+		shadow.schemas[v] = r.schemas[v]
+	}
+	// Enabling the candidate goes through the identical gray-safety path used
+	// online; evaluatePlan already guaranteed this succeeds.
+	if _, err := shadow.CommitUpgrade(candidate); err != nil {
+		// Unreachable for a plan that evaluatePlan accepted; keep the shadow
+		// on the last known version rather than panicking inside a dry run.
+		return shadow
+	}
+	return shadow
+}
+
 func (r *Registry) latestVersionLocked() int {
 	latest := 0
 	for v := range r.schemas {

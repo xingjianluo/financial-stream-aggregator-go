@@ -127,7 +127,15 @@ func (a *Aggregator) Watermark() int64 {
 func (a *Aggregator) Submit(e market.Event) (market.Decision, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	return a.submitLocked(e)
+}
 
+// submitLocked runs the full decision pipeline for one delivery on the
+// aggregator's current state. It MUST be called with a.mu held. The dry-run
+// upgrade trial drives the SAME function on a throwaway shadow aggregator,
+// which is what makes trial verdicts identical to online processing: there is
+// only one implementation of the decision rules.
+func (a *Aggregator) submitLocked(e market.Event) (market.Decision, error) {
 	e = cloneEvent(e) // internal state must not alias caller-owned maps
 	fp := ContentFingerprint(e)
 	win := a.WindowOf(e.EventTime)
@@ -404,6 +412,73 @@ func (a *Aggregator) SideOutput() []market.Event {
 	out := make([]market.Event, len(a.side))
 	copy(out, a.side)
 	return out
+}
+
+// shadowState is a point-in-time, read-only view of the online state that
+// decides whether an event is accepted, rejected or deduplicated:
+//   - Watermark: the event-time threshold for late/sealed classification;
+//   - Seen: every logical id already delivered, with its first delivery and
+//     its FIRST verdict, so retries replay the original conclusion and
+//     cross-version redelivery is reconciled against the first payload.
+//
+// Open-window statistics are deliberately absent: accept/reject decisions
+// never depend on them (windows are created lazily), and the trial must not
+// be able to perturb online stats.
+type shadowState struct {
+	Watermark int64
+	Seen      map[string]seenEvent
+	Config    config
+}
+
+// snapshotStateLocked returns a deep copy of the decision-relevant online
+// state. The copy shares nothing mutable with the live aggregator (stored
+// events carry their own Fields maps), so a trial can replay the whole batch
+// on the copy without changing the watermark, sealed windows, seen events or
+// any online statistic. Must be called with a.mu held.
+func (a *Aggregator) snapshotStateLocked() shadowState {
+	seen := make(map[string]seenEvent, len(a.seen))
+	for id, s := range a.seen {
+		s.first = cloneEvent(s.first)
+		s.decided = cloneDecision(s.decided)
+		seen[id] = s
+	}
+	return shadowState{Watermark: a.watermark, Seen: seen, Config: a.cfg}
+}
+
+// cloneDecision deep-copies the pointer/slice-bearing parts of a Decision so a
+// remembered verdict stored in a shadow state can never alias the online one.
+func cloneDecision(d market.Decision) market.Decision {
+	if d.Window != nil {
+		w := *d.Window
+		d.Window = &w
+	}
+	if d.Defaulted != nil {
+		d.Defaulted = append([]string(nil), d.Defaulted...)
+	}
+	return d
+}
+
+// snapshotState locks the aggregator and returns its deep-copied decision
+// state. Used by the read-only upgrade trial.
+func (a *Aggregator) snapshotState() shadowState {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.snapshotStateLocked()
+}
+
+// newShadowAggregator builds a throwaway aggregator that replays the exact
+// Submit decision rules (via submitLocked) against a copied online state and
+// the trial's registry (existing schemas + the candidate). Its watermark,
+// seen-set and window statistics are isolated from the live aggregator.
+func newShadowAggregator(state shadowState, reg *Registry) *Aggregator {
+	a := &Aggregator{
+		reg:       reg,
+		cfg:       state.Config,
+		watermark: state.Watermark,
+		open:      make(map[int64]*openWindow),
+		seen:      state.Seen,
+	}
+	return a
 }
 
 // cloneEvent deep-copies the caller-supplied map so later mutation by the

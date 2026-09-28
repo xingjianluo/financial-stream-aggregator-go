@@ -44,11 +44,26 @@
 
 ## 干跑试算（UpgradePlanner.TrialUpgrade，见 TrialItem.Outcome）
 
-| 结论 | 含义 |
-|---|---|
-| `accepted` | 事件满足候选 schema；缺失的可选字段已按声明默认值补齐（`Defaulted` 列出字段） |
-| `data_rejected` | **升级本身可行**，但这一条历史数据不满足候选结构（`Reason` 给出事件级原因） |
-| `skipped_plan_incompatible` | **这次升级本身不兼容**（`TrialReport.Compatible=false`，如新增字段无默认值），逐条跳过 |
+上线前预演请用 `NewOnlineUpgradePlanner(agg)`：它对**当前在线状态的快照**（水位、
+已封存窗口由水位推出、已见事件集合、窗口/迟到配置）做只读重放。预演在影子注册表
+（历史版本重放 + 候选 `CommitUpgrade`）和影子聚合器（在线状态深拷贝）上逐条调用与
+`Aggregator.Submit` 相同的判定代码，因此逐条结论与正式处理一致。报告字段
+`OnlineBound/OnlineWatermark/OnlineSeen` 记录所依据的在线快照。
 
-干跑为只读：不修改注册表与任何在线状态；同一批输入重复试跑结论一致；通过后
-`CommitUpgrade` 并在线处理同一批事件，逐条结论与试跑一致。
+| 结论 | 含义 | 是否计数 |
+|---|---|---|
+| `accepted` | **首次计入**：当前状态下接受（按时，或窗口仍开且宽限内按策略计入） | 是 |
+| `duplicate` | **重复不计入**：逻辑 ID 已在线上或本批更早出现；回放首次判定。`Duplicate/CrossVersion/MatchedVer/Defaulted` 与在线一致；跨版本等价重投不会因新旧表示不同被误判成冲突 | 否（已计过） |
+| `data_rejected` | **明确拒绝**：升级方案可行，但该条在当前状态下本就该拒，`Reason` 给逐条依据——`window_sealed`（所属窗口已封）、`late_dropped`（超宽限或策略为 reject）、`conflict`、`cross_version_conflict`、各类 `schema_*` | 否 |
+| `skipped_plan_incompatible` | **升级方案本身不兼容**（`TrialReport.Compatible=false`，如新增字段无默认值），逐条跳过，与单条数据失败严格分开 | — |
+
+注意：同 ID 内容冲突的重投在线上同样带 `Duplicate=true` 标记，但该判定不被接受，
+预演中归为 `data_rejected`（不是 `duplicate`）；首次判定本身是拒绝（如
+`window_sealed`/`late_dropped`）的重投，回放该拒绝，仍归 `data_rejected`。
+
+干跑为只读：不修改水位、已封存窗口、已见事件、侧输出或任何在线统计；相同输入 +
+相同在线状态重复试跑报告逐字节一致。通过后 `CommitUpgrade` 并用同一批事件、同样的
+当前状态在线处理，逐条“接受/拒绝 + 原因 + 重复/跨版本标记 + 窗口 + 判定时水位”都
+与试算一致（`pipeline/trial_online_test.go` 覆盖封窗范围内重投、迟到、重复、跨版本
+等价重投、数值拓宽等价与真实冲突）。纯结构预览可用
+`NewUpgradePlanner(reg)`，但它按空在线状态判断，不能代表上线结论。

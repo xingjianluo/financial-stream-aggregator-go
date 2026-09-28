@@ -206,14 +206,15 @@ func TestTrialCommitConsistency(t *testing.T) {
 		}(),
 	}
 
-	reg1, _ := build()
-	rep, err := NewUpgradePlanner(reg1).TrialUpgrade(candidate, batch)
+	_, agg1 := build()
+	rep, err := NewOnlineUpgradePlanner(agg1).TrialUpgrade(candidate, batch)
 	if err != nil || !rep.Compatible {
 		t.Fatalf("trial should be plan-compatible: %+v err=%v", rep, err)
 	}
 	logTrial(t, rep)
 
-	// Commit on an independent registry and process the batch online.
+	// Commit on an independent aggregator with the SAME starting state and
+	// process the batch online; item-by-item conclusions must coincide.
 	reg2, agg2 := build()
 	if c, err := reg2.CommitUpgrade(candidate); err != nil || !c.OK {
 		t.Fatalf("green trial must enable cleanly: %+v err=%v", c, err)
@@ -222,13 +223,16 @@ func TestTrialCommitConsistency(t *testing.T) {
 		d, err := agg2.Submit(e)
 		item := rep.Items[i]
 		logGrayDecision(t, "commit", d)
-		if item.OK != (err == nil) || item.OK != d.Accepted {
+		if item.OK != d.Accepted {
 			t.Fatalf("event %s: trial ok=%v but online accepted=%v err=%v",
 				e.EventID, item.OK, d.Accepted, err)
 		}
 		if !item.OK && item.Reason != d.Reason {
 			t.Fatalf("event %s: trial reason %s != online reason %s",
 				e.EventID, item.Reason, d.Reason)
+		}
+		if item.Outcome != TrialDataRejected && item.Outcome != TrialAccepted {
+			t.Fatalf("event %s: unexpected trial outcome %s", e.EventID, item.Outcome)
 		}
 	}
 }

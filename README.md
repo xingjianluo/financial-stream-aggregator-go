@@ -7,7 +7,8 @@
 - 包：
   - `market`：领域类型（事件、窗口、窗口统计、判定结果、可区分拒绝原因）。
   - `pipeline`：聚合器（`Aggregator`）、结构注册表（`Registry`）、内容指纹、
-    灰度升级规划器（`UpgradePlanner`，含干跑试算）。
+    灰度升级规划器（`UpgradePlanner`，含**结合在线状态**的干跑试算，逐条与正式
+    处理对齐）。
 - 仅依赖 Go 标准库；Go ≥ 1.25。
 
 ## 快速验证
@@ -23,6 +24,8 @@ go test -v ./pipeline/        # 查看每个判定的版本/窗口/水位/事件
 
 ```bash
 go test -v -run 'Gray|CrossVersion|Default|Upgrade|Trial|Widening' ./pipeline/
+# 预演（结合水位/封窗/已见事件）与正式处理逐条一致性：
+go test -v -run 'TrialOnline|TrialCommitConsistency' ./pipeline/
 ```
 
 ## 1. 滚动窗口与水位语义
@@ -183,18 +186,50 @@ price:int64, quantity:int64, is_trade:bool`。演进规则（仅允许增量）�
 - ❌ 删字段/重命名、类型收窄或跨类型变更、跳号/版本回退/同号异内容：沿用第 4 节
   各自原因，与上面的灰度原因互不混淆。
 
-### 7.4 升级前干跑试算
+### 7.4 升级前干跑试算（结合在线状态，逐条与正式处理对齐）
 
-`planner := pipeline.NewUpgradePlanner(reg)`，
-`rep, _ := planner.TrialUpgrade(candidate, batch)` 在**只读**状态下预演：
+预演不是单纯的“结构能不能读”，而是**在当前在线状态的快照上把整批事件按正式
+处理路径原样重放一遍**。
 
-- `rep.Compatible=false`：**这次升级本身不兼容**（如新字段无默认值），每条事件标记
-  `skipped_plan_incompatible`，汇总 `PlanCompatible=false`；注册表/在线状态不变；
-- `rep.Compatible=true` 但个别条目 `Outcome=data_rejected`：**升级没问题，只是该条
-  历史数据不满足要求**（带独立原因），与方案级不兼容严格区分；
-- 通过的条目给出 `accepted` 与补齐字段清单；同一批输入重复试跑结论逐字节一致；
-- 试跑通过后 `CommitUpgrade` 再对同一批事件在线处理，逐条“接受/拒绝 + 原因”结论
-  与试跑一致（见 `TestTrialCommitConsistency`）。
+- 构造方式：
+  - `pipeline.NewOnlineUpgradePlanner(agg)`（**上线预演必须用这个**）：预演结合
+    聚合器当前的在线状态——
+    - **当前水位**：据此判定 `window_sealed`（所属窗口 `End <= 水位`）、
+      `late_dropped`（窗口仍开但超出 `AllowedLateMs`，或策略为 `reject`）、
+      宽限内计入 + 侧输出；
+    - **已见事件集合**（含每次首投的原始事件与首次判定）：据此判定普通重复、
+      同版本 `conflict`、跨版本等价重投与 `cross_version_conflict`；
+    - 窗口/迟到相关配置（窗口长度、允许迟到、迟到策略）。
+  - `pipeline.NewUpgradePlanner(reg)`：只做纯结构预览，按**空在线状态**（水位 0、
+    无已见事件）判断，不能用来推断上线后的接受/拒绝。
+- 实现方式：方案级校验通过后，预演在**隔离的影子注册表**（按序重放全部历史版本 +
+  `CommitUpgrade(candidate)`）与**影子聚合器**（在线状态的深拷贝：水位、已见事件、
+  配置）上逐条调用与 `Aggregator.Submit` **完全相同**的判定代码。因此预演逐条结论
+  （接受/拒绝、拒绝原因、重复/跨版本标记、所属窗口、判定时水位）与“`CommitUpgrade`
+  后用同一批事件、同样的当前状态在线处理”逐条一致。报告中的
+  `OnlineBound/OnlineWatermark/OnlineSeen` 记录所依据的在线快照。
+- 逐条结论分三类（`TrialItem.Outcome`），与正式处理一一对应：
+  - `accepted`：**首次计入**的接受事件；
+  - `duplicate`：逻辑 ID 已在线上或本批更早出现过，**重复不计入**，回放首次判定；
+    `Duplicate/CrossVersion/MatchedVer/Defaulted` 与在线一致（跨版本等价重投不会
+    因表示不同被误判成冲突；重复绝不因预演多计一次）；
+  - `data_rejected`：**明确拒绝**，`Reason` 给出逐条依据，涵盖封窗
+    `window_sealed`、迟到 `late_dropped`、同版本 `conflict`、跨版本真实冲突
+    `cross_version_conflict` 以及各类 schema 原因。注意：同 ID 内容冲突的重投在线上
+    也带 `Duplicate=true`，但只要该判定不被接受就属于 `data_rejected`。
+- 两级失败仍严格分开：
+  - `rep.Compatible=false`：**升级方案本身不兼容**（如新增字段无默认值），每条事件
+    标记 `skipped_plan_incompatible`，`PlanCompatible=false`，注册表/在线状态不变；
+  - `rep.Compatible=true` 但个别条目 `data_rejected`：**升级可行，只是该条数据在当前
+    状态下本就该拒绝**（封窗、迟到、冲突、结构不满足等），不能因个别数据失败把整个
+    升级判成不可用，也不能把方案级失败混成数据失败。
+- 只读、可重放：预演不改动水位、已封存窗口、已见事件、侧输出或任何在线统计；
+  相同输入 + 相同在线状态重复预演，报告逐字节一致（见
+  `TestTrialReadOnlyAndReplayable`）。
+- 预演整体通过后，`CommitUpgrade` 再对**同一批事件、同样的当前状态**在线处理，
+  逐条“接受/拒绝 + 原因 + 重复标记”都与预演对得上（见
+  `TestTrialCommitConsistency` 与 `pipeline/trial_online_test.go` 中封窗、迟到、
+  跨版本/拓宽/冲突各场景）。
 
 ### 7.5 最小灰度用法
 
@@ -204,10 +239,18 @@ v2 := pipeline.Schema{Version: 2, Fields: append(
     pipeline.FieldSpec{Name: "venue", Type: market.TypeString,
         HasDefault: true, Default: "UNKNOWN"})}
 
-planner := pipeline.NewUpgradePlanner(reg)
+// 预演必须结合在线聚合器的当前状态（水位/封窗/已见事件）。
+planner := pipeline.NewOnlineUpgradePlanner(agg)
 if rep, _ := planner.TrialUpgrade(v2, history); rep.Compatible {
-    reg.CommitUpgrade(v2) // 干跑通过后才启用
+    reg.CommitUpgrade(v2) // 干跑通过后才启用；随后用同一批事件在线处理逐条一致
 }
+```
+
+本地验证预演与正式处理逐条一致：
+
+```bash
+go test -v -run 'TrialOnline|TrialCommitConsistency' ./pipeline/
+go test -race ./...
 ```
 
 ## 8. 最小用法
