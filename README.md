@@ -19,11 +19,27 @@ go test -race ./...           # 并发安全检查（含灰度双生产者并发
 go test -v ./pipeline/        # 查看每个判定的版本/窗口/水位/事件时间/判定依据日志
 ```
 
-灰度升级相关用例可单独运行：
+灰度升级与在线状态试算相关用例可单独运行：
 
 ```bash
-go test -v -run 'Gray|CrossVersion|Default|Upgrade|Trial|Widening' ./pipeline/
+go test -v -run 'Gray|CrossVersion|Default|Upgrade|Trial|Widening' ./pipeline
 ```
+
+本地验证“预演与正式处理逐条一致”最直接的方式：`-v` 运行上面的用例，对照
+`[trial]` 与 `[live]` 两类逐条日志的 `outcome/reason/dup/cross/matched_ver/
+window/watermark`。其中：
+
+- `TestTrialSealedWindowRedelivery`：封窗范围内的首投、相同内容重投、跨版本等价
+  重投，断言预演与正式逐条一致（首投 `window_sealed`，重投回放接受且不重计）；
+- `TestTrialLateEvents`：宽限内/超宽限迟到与 `PolicyReject` 两种策略；
+- `TestTrialBatchDuplicates`：同批内首次计入、相同重复、跨版本等价重投、
+  同版本 `conflict`、跨版本 `cross_version_conflict` 四类逐条区分；
+- `TestTrialReplayRejectedFirstVerdict`：首次即被拒（封窗）的 ID 被重投时回放
+  原拒绝，归类为 `duplicate` 而非接受或另算一次拒绝；
+- `TestTrialDeterministicAndReadOnly`：相同状态重复试跑一致，且水位/封窗/台账/
+  侧输出/注册表均不被试算改动；
+- `TestTrialThenCommitSameInstance`：同一聚合器上“预演→按 `AllPassed` 闸门
+  启用→同批正式处理”逐条对得上。
 
 ## 1. 滚动窗口与水位语义
 
@@ -183,18 +199,62 @@ price:int64, quantity:int64, is_trade:bool`。演进规则（仅允许增量）�
 - ❌ 删字段/重命名、类型收窄或跨类型变更、跳号/版本回退/同号异内容：沿用第 4 节
   各自原因，与上面的灰度原因互不混淆。
 
-### 7.4 升级前干跑试算
+### 7.4 升级前干跑试算（结合当前在线状态，只读）
 
-`planner := pipeline.NewUpgradePlanner(reg)`，
-`rep, _ := planner.TrialUpgrade(candidate, batch)` 在**只读**状态下预演：
+`planner := pipeline.NewUpgradePlanner(reg, agg)`，
+`rep, _ := planner.TrialUpgrade(candidate, batch)` 在**只读**状态下预演。
+试算不是只做结构投影：它会对**当前在线状态**做一次深拷贝快照（注册表并在影子上
+登记候选 schema、当前水位、已封存/进行中的窗口、允许迟到宽限与迟到策略、
+**全部已见事件台账**、侧输出），然后在影子聚合器上用与 `Aggregator.Submit`
+**完全相同的判定代码路径**逐条处理这一批事件。因此每条预演结论天然就是
+“此刻启用升级并正式处理这条事件”会得到的结论。预演读取的在线状态包括：
 
-- `rep.Compatible=false`：**这次升级本身不兼容**（如新字段无默认值），每条事件标记
-  `skipped_plan_incompatible`，汇总 `PlanCompatible=false`；注册表/在线状态不变；
-- `rep.Compatible=true` 但个别条目 `Outcome=data_rejected`：**升级没问题，只是该条
-  历史数据不满足要求**（带独立原因），与方案级不兼容严格区分；
-- 通过的条目给出 `accepted` 与补齐字段清单；同一批输入重复试跑结论逐字节一致；
-- 试跑通过后 `CommitUpgrade` 再对同一批事件在线处理，逐条“接受/拒绝 + 原因”结论
-  与试跑一致（见 `TestTrialCommitConsistency`）。
+- **当前水位与封窗**：事件所属窗口 `End <= 当前水位`（已封存）时，首次投递以
+  `window_sealed` 拒绝，封窗后的历史/回放事件不会再被预演说成“能通过”；
+- **允许迟到宽限与迟到策略**：窗口仍开但 `watermark - t > AllowedLateMs` 为
+  `late_dropped`；宽限内按 `PolicyDrop`（计数+侧输出）或 `PolicyReject`（拒绝），
+  与第 3 节完全一致；
+- **已见事件台账（含本批内部）**：批次内先到先计、后到的重复不重复计数，
+  与正式处理同样的顺序语义；对升级前在线台账里已经见过的 ID，回放其首次判定；
+- **结构校验与跨版本调和**：事件按自身声明版本在“已登记候选 schema”的影子
+  注册表上校验，去重/冲突/跨版本等价规则与第 2、7.1 节同一条代码路径。
+
+逐条结论分三类（`TrialItem.Outcome`），彼此严格区分：
+
+- `accepted`：**首次**投递且被接受并计入（`Counted=true`）；
+- `duplicate`：已见 ID 的重复投递，**不重复计数**（`Counted=false`）。`Decision`
+  字段原样回放首次判定：相同内容重复、跨版本等价重投（`Duplicate=true,
+  CrossVersion=true`，`MatchedVer`/`Defaulted` 给依据）都回放接受；若某 ID 的
+  首次判定本身就是拒绝（例如该 ID 第一次到达时窗口已封），重复投递回放那次
+  拒绝（`Accepted=false` 且带原原因），仍归类为 `duplicate`；
+- `data_rejected`：**首次**投递在当前状态下被明确拒绝（非空 `*RejectedError`）：
+  `window_sealed`/`late_dropped`/`conflict`/`cross_version_conflict`/`schema_*`。
+  注意同版本/跨版本**冲突重投**带 `Duplicate=true` 但同时带拒绝错误，属于
+  明确拒绝（`data_rejected`），与“等价重复、不计数”的 `duplicate` 可区分。
+
+两个失败层级仍然分开：
+
+- `rep.Compatible=false`：**这次升级本身不兼容**（如新字段无默认值），每条事件
+  标记 `skipped_plan_incompatible`，汇总 `PlanCompatible=false`；注册表/在线状态
+  不变；
+- `rep.Compatible=true` 但个别条目 `Outcome=data_rejected`：**升级没问题，只是该
+  条数据在当前在线状态下会被拒**（带独立原因），与方案级不兼容严格区分，不因为
+  个别数据条失败就把整个升级说成不可用。
+
+`rep.AllPassed()` 是启用闸门：方案兼容且**每条**都不会被明确拒绝（回放接受的
+重复不算失败，回放拒绝/首次拒绝都算失败）。
+
+可重放与只读保证：
+
+- **相同输入 + 相同在线状态**重复试跑，逐条结论一致；`OnlineWatermark` 记录试算
+  所依据的水位，水位推进后再试结论可以不同（因为在线状态变了），这是预期；
+- 试算全程**不改动**水位、窗口（开/封）、已见事件台账、侧输出或注册表：试算里
+  “接受”的事件不会被在线台账记住，之后真实首投仍只计一次；
+- 试算整体通过（`AllPassed`）后 `CommitUpgrade`，再用同一批事件、同一当前状态
+  正式处理，逐条的接受/拒绝、原因、重复/跨版本标记、窗口、水位都对得上
+  （见 `TestTrialCommitConsistency`、`TestTrialSealedWindowRedelivery`、
+  `TestTrialLateEvents`、`TestTrialBatchDuplicates`、
+  `TestTrialThenCommitSameInstance`）。
 
 ### 7.5 最小灰度用法
 
@@ -204,9 +264,9 @@ v2 := pipeline.Schema{Version: 2, Fields: append(
     pipeline.FieldSpec{Name: "venue", Type: market.TypeString,
         HasDefault: true, Default: "UNKNOWN"})}
 
-planner := pipeline.NewUpgradePlanner(reg)
-if rep, _ := planner.TrialUpgrade(v2, history); rep.Compatible {
-    reg.CommitUpgrade(v2) // 干跑通过后才启用
+planner := pipeline.NewUpgradePlanner(reg, agg) // 预演依据 agg 的当前在线状态
+if rep, _ := planner.TrialUpgrade(v2, history); rep.AllPassed() {
+    reg.CommitUpgrade(v2) // 干跑逐条通过后才启用
 }
 ```
 

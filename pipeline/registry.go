@@ -158,6 +158,29 @@ func (r *Registry) Get(version int) (Schema, bool) {
 	return s, ok
 }
 
+// snapshotLocked copies the version->schema map. Schema values are immutable
+// once registered, so a shallow copy of the map is a sufficient detached view.
+// Callers must hold r.mu (read or write).
+func (r *Registry) snapshotLocked() map[int]Schema {
+	out := make(map[int]Schema, len(r.schemas))
+	for v, s := range r.schemas {
+		out[v] = s
+	}
+	return out
+}
+
+// newRegistryFromMap builds a registry over an independently owned copy of
+// schemas. It is the constructor for the dry run's detached registry view:
+// trial runs register the candidate schema ONLY on that copy, never on the
+// live registry.
+func newRegistryFromMap(schemas map[int]Schema) *Registry {
+	out := make(map[int]Schema, len(schemas))
+	for v, s := range schemas {
+		out[v] = s
+	}
+	return &Registry{schemas: out}
+}
+
 // Versions returns all registered version numbers in ascending order.
 func (r *Registry) Versions() []int {
 	r.mu.RLock()

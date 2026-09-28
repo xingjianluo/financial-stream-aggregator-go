@@ -1,7 +1,6 @@
 package pipeline
 
 import (
-	"fmt"
 	"reflect"
 	"testing"
 
@@ -106,7 +105,7 @@ func TestTrialPlanIncompatible(t *testing.T) {
 	if _, err := reg.Register(v1Schema()); err != nil {
 		t.Fatal(err)
 	}
-	planner := NewUpgradePlanner(reg)
+	planner := NewUpgradePlanner(reg, New(reg, WithWindowSize(10)))
 	batch := []market.Event{v1Event("t1", 1, 1, 1), v1Event("t2", 2, 1, 1)}
 
 	bad := v2SchemaAddVenue() // new field without default -> plan incompatible
@@ -141,11 +140,11 @@ func TestTrialDataFailuresDistinctFromPlan(t *testing.T) {
 	if _, err := reg.Register(v1Schema()); err != nil {
 		t.Fatal(err)
 	}
-	planner := NewUpgradePlanner(reg)
+	planner := NewUpgradePlanner(reg, New(reg, WithWindowSize(10)))
 	candidate := v2GraySchema()
 
 	batch := []market.Event{
-		v1Event("ok1", 1, 1, 1),                // old event: defaults fill venue/fee -> accepted
+		v1Event("ok1", 1, 1, 1),                // old event, valid under its own v1 -> accepted
 		v2EventWith("ok2", 2, 1, 1, "NYSE", 3), // complete new event -> accepted
 		func() market.Event {
 			e := v2EventWith("bad-type", 3, 1, 1, "NYSE", 3)
@@ -161,32 +160,40 @@ func TestTrialDataFailuresDistinctFromPlan(t *testing.T) {
 	if !rep1.Compatible {
 		t.Fatalf("plan with safe defaults must be compatible: %s", rep1.Reason)
 	}
-	if rep1.Summary.Accepted != 2 || rep1.Summary.DataRejected != 1 {
+	if rep1.Summary.Accepted != 2 || rep1.Summary.Duplicated != 0 ||
+		rep1.Summary.DataRejected != 1 {
 		t.Fatalf("summary = %+v", rep1.Summary)
 	}
 	if rep1.Items[2].Outcome != TrialDataRejected ||
 		rep1.Items[2].Reason != market.CauseSchemaFieldTypeMismatch {
 		t.Fatalf("per-data failure must be distinguishable: %+v", rep1.Items[2])
 	}
-	if rep1.Items[0].Outcome != TrialAccepted ||
-		!reflect.DeepEqual(rep1.Items[0].Defaulted, []string{"fee_bps", "venue"}) {
-		t.Fatalf("old event should be accepted via defaults: %+v", rep1.Items[0])
+	if rep1.Items[0].Outcome != TrialAccepted || !rep1.Items[0].Accepted ||
+		!rep1.Items[0].Counted {
+		t.Fatalf("old valid event should be accepted and counted: %+v", rep1.Items[0])
+	}
+	if rep1.AllPassed() {
+		t.Fatalf("AllPassed must be false when an item is rejected")
 	}
 	if vs := reg.Versions(); len(vs) != 1 {
 		t.Fatalf("trial must remain read-only: %v", vs)
 	}
 
-	// Same inputs -> identical report (deterministic replay).
+	// Same inputs -> identical report (deterministic replay). Compare by
+	// VALUE (Window is a pointer in the item, so pointer addresses must not
+	// count).
 	rep2, _ := planner.TrialUpgrade(candidate, batch)
-	if fmt.Sprint(rep1) != fmt.Sprint(rep2) {
-		t.Fatalf("repeated dry run must be identical:\n%+v\n%+v", rep1, rep2)
+	if trialReportsEqual(rep1, rep2) != "" {
+		t.Fatalf("repeated dry run must be identical: %s\n%+v\n%+v",
+			trialReportsEqual(rep1, rep2), rep1, rep2)
 	}
 	t.Log("[trial] repeated dry run reproduced identical report")
 }
 
 // TestTrialCommitConsistency: after a green dry run, enabling the upgrade and
-// submitting the SAME batch yields the same per-event structural conclusion
-// (accepted vs rejected and cause).
+// submitting the SAME batch from the SAME starting online state yields the
+// same per-event verdict field by field (accepted/rejected, cause, duplicate,
+// cross-version markers, matched version).
 func TestTrialCommitConsistency(t *testing.T) {
 	build := func() (*Registry, *Aggregator) {
 		reg := NewRegistry()
@@ -206,29 +213,34 @@ func TestTrialCommitConsistency(t *testing.T) {
 		}(),
 	}
 
-	reg1, _ := build()
-	rep, err := NewUpgradePlanner(reg1).TrialUpgrade(candidate, batch)
+	// Dry run on one live registry/aggregator (v1 only, empty online state).
+	reg1, agg1 := build()
+	rep, err := NewUpgradePlanner(reg1, agg1).TrialUpgrade(candidate, batch)
 	if err != nil || !rep.Compatible {
 		t.Fatalf("trial should be plan-compatible: %+v err=%v", rep, err)
 	}
 	logTrial(t, rep)
 
-	// Commit on an independent registry and process the batch online.
+	// Commit on an independent registry with the same starting state and
+	// process the batch online, comparing item by item.
 	reg2, agg2 := build()
 	if c, err := reg2.CommitUpgrade(candidate); err != nil || !c.OK {
 		t.Fatalf("green trial must enable cleanly: %+v err=%v", c, err)
 	}
-	for i, e := range batch {
+	var liveDecisions []market.Decision
+	var liveErrs []error
+	for _, e := range batch {
 		d, err := agg2.Submit(e)
-		item := rep.Items[i]
-		logGrayDecision(t, "commit", d)
-		if item.OK != (err == nil) || item.OK != d.Accepted {
-			t.Fatalf("event %s: trial ok=%v but online accepted=%v err=%v",
-				e.EventID, item.OK, d.Accepted, err)
-		}
-		if !item.OK && item.Reason != d.Reason {
-			t.Fatalf("event %s: trial reason %s != online reason %s",
-				e.EventID, item.Reason, d.Reason)
-		}
+		liveDecisions = append(liveDecisions, d)
+		liveErrs = append(liveErrs, err)
+	}
+	assertTrialMatchesLive(t, rep, liveDecisions, liveErrs)
+
+	// The trial was read-only: registry stayed on v1 and no stats exist.
+	if vs := reg1.Versions(); len(vs) != 1 || vs[0] != 1 {
+		t.Fatalf("trial must not mutate the registry: %v", vs)
+	}
+	if ws := agg1.SealedWindows(); len(ws) != 0 {
+		t.Fatalf("trial must not seal windows: %+v", ws)
 	}
 }

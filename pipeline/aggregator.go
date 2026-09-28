@@ -419,6 +419,99 @@ func cloneEvent(e market.Event) market.Event {
 	return e
 }
 
+// shadowClone builds a DETACHED copy of the aggregator (watermark, open
+// windows, sealed-window history, seen-event ledger and side output) over a
+// detached registry view. The dry run submits the replay batch on the shadow
+// through the IDENTICAL Submit code path, so every verdict (sealed window,
+// lateness, dedup, conflict, cross-version reconciliation) is the one the live
+// aggregator would return for the same input starting from this state.
+//
+// Lock order matches Submit (aggregator lock, then the registry is only read
+// through Validate/SemanticFingerprint which take the registry lock): the
+// snapshot is taken under the aggregator lock and the registry snapshot is
+// taken inside the same critical section to guarantee a coherent pair.
+//
+// The caller must already have established that candidate is a safe evolution
+// (evaluatePlan). When commitCandidate is true it is recorded on the SHADOW
+// registry only, mirroring what the live registry looks like immediately after
+// CommitUpgrade; re-committing an already-present identical version is a
+// no-op, matching CommitUpgrade idempotency. The live aggregator and its
+// registry are never mutated.
+func (a *Aggregator) shadowClone(candidate Schema, commitCandidate bool) *Aggregator {
+	a.mu.Lock()
+	cfg := a.cfg
+	wm := a.watermark
+
+	open := make(map[int64]*openWindow, len(a.open))
+	for start, w := range a.open {
+		nw := &openWindow{
+			id:     w.id,
+			count:  w.count,
+			volume: w.volume,
+			price:  w.price,
+			bySym:  make(map[string]*market.SymbolCount, len(w.bySym)),
+		}
+		for sym, sc := range w.bySym {
+			cp := *sc
+			nw.bySym[sym] = &cp
+		}
+		open[start] = nw
+	}
+
+	sealed := make([]market.WindowStats, len(a.sealed))
+	copy(sealed, a.sealed)
+	for i := range sealed {
+		sealed[i].BySymbol = append([]market.SymbolCount(nil), sealed[i].BySymbol...)
+	}
+
+	seen := make(map[string]seenEvent, len(a.seen))
+	for id, s := range a.seen {
+		s.first = cloneEvent(s.first)
+		s.decided = cloneDecision(s.decided)
+		seen[id] = s
+	}
+
+	side := make([]market.Event, len(a.side))
+	for i, e := range a.side {
+		side[i] = cloneEvent(e)
+	}
+
+	// Snapshot the registry inside the same critical section so the schema
+	// view and the online state are one coherent pair. Lock order is
+	// aggregator -> registry, identical to Submit (which holds the aggregator
+	// lock while Validate/SemanticFingerprint take the registry lock).
+	a.reg.mu.RLock()
+	schemas := a.reg.snapshotLocked()
+	a.reg.mu.RUnlock()
+	a.mu.Unlock()
+
+	shadowReg := newRegistryFromMap(schemas)
+	if commitCandidate {
+		if _, exists := shadowReg.schemas[candidate.Version]; !exists {
+			shadowReg.schemas[candidate.Version] = candidate
+		}
+	}
+
+	return &Aggregator{
+		reg:       shadowReg,
+		cfg:       cfg,
+		watermark: wm,
+		open:      open,
+		sealed:    sealed,
+		seen:      seen,
+		side:      side,
+	}
+}
+
+// cloneDecision deep-copies a Decision, in particular its window pointer.
+func cloneDecision(d market.Decision) market.Decision {
+	if d.Window != nil {
+		w := *d.Window
+		d.Window = &w
+	}
+	return d
+}
+
 func windowPtr(w market.Window) *market.Window {
 	cp := w
 	return &cp
