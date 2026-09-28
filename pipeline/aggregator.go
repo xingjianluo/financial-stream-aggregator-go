@@ -5,6 +5,7 @@
 package pipeline
 
 import (
+	"fmt"
 	"sort"
 	"sync"
 
@@ -55,7 +56,8 @@ type openWindow struct {
 
 // seenEvent remembers one accepted/known event id for idempotent dedup.
 type seenEvent struct {
-	fp      string
+	fp      string // canonical (cross-version) content fingerprint
+	version int    // schema version of the FIRST delivery
 	window  market.Window
 	late    bool
 	decided market.Decision
@@ -123,13 +125,11 @@ func (a *Aggregator) Submit(e market.Event) (market.Decision, error) {
 	defer a.mu.Unlock()
 
 	e = cloneEvent(e) // internal state must not alias caller-owned maps
-	fp := ContentFingerprint(e)
 	win := a.WindowOf(e.EventTime)
 	d := market.Decision{
 		EventID:   e.EventID,
 		EventTime: e.EventTime,
 		Window:    windowPtr(win),
-		ContentFP: fp,
 		Watermark: a.watermark,
 	}
 
@@ -140,23 +140,47 @@ func (a *Aggregator) Submit(e market.Event) (market.Decision, error) {
 		return d, &RejectedError{Cause: cause, Detail: detail}
 	}
 
-	// 2. Idempotent dedup / explicit conflict.
+	// The gray-rollout dedup layer compares CANONICAL logical content:
+	// schema-version label stripped, widened numerics normalized, optional
+	// fields carrying their declared default treated as absent. An old/new
+	// producer pair describing the same logical event hashes identically,
+	// while a substantive value change (price/quantity/new-field value)
+	// hashes differently and is a conflict.
+	fp, cause, cdetail := a.reg.DedupFingerprint(e)
+	if cause != market.CauseNone {
+		d.Reason = cause
+		d.Detail = cdetail
+		return d, &RejectedError{Cause: cause, Detail: cdetail}
+	}
+	d.ContentFP = fp
+
+	// 2. Idempotent dedup / explicit conflict, compared on CANONICAL content:
+	//    - same canonical fp  -> duplicate (cross-version included), replay
+	//      the original verdict exactly once, counted once, regardless of
+	//      which producer/version wins the race or of arrival order;
+	//    - different canonical fp -> a substantive content conflict, never a
+	//      version-label difference.
 	if prev, ok := a.seen[e.EventID]; ok {
 		d.Duplicate = true
 		if prev.fp != fp {
 			d.Reason = market.CauseConflict
 			d.Detail = "event_id " + e.EventID +
-				" already seen with different content"
+				" already seen with different canonical content"
 			return d, &RejectedError{Cause: market.CauseConflict, Detail: d.Detail}
 		}
-		// Same content: replay the ORIGINAL verdict (same acceptance and
-		// reason, so retried delivery never changes any statistic), while
+		// Same canonical content: replay the ORIGINAL verdict (same acceptance
+		// and reason, so retried delivery never changes any statistic), while
 		// flagging THIS delivery as a duplicate and reporting the now-current
 		// watermark for auditability.
 		replay := prev.decided
 		replay.Duplicate = true
 		replay.Watermark = a.watermark
 		replay.Window = windowPtr(prev.window)
+		if prev.version != e.SchemaVer {
+			replay.Detail = replay.Detail +
+				fmt.Sprintf("; cross-version duplicate (first seen as schema v%d, this delivery is v%d)",
+					prev.version, e.SchemaVer)
+		}
 		return replay, nil
 	}
 
@@ -167,19 +191,19 @@ func (a *Aggregator) Submit(e market.Event) (market.Decision, error) {
 			// Its window is already sealed: results are immutable.
 			d.Reason = market.CauseWindowSealed
 			d.Detail = "window is sealed by watermark; late event rejected"
-			a.remember(d, win, false)
+			a.remember(d, win, false, e.SchemaVer)
 			return d, &RejectedError{Cause: market.CauseWindowSealed, Detail: d.Detail}
 		}
 		if a.watermark-e.EventTime > a.cfg.allowedLateMs {
 			d.Reason = market.CauseLateDropped
 			d.Detail = "lateness exceeds allowed lateness"
-			a.remember(d, win, false)
+			a.remember(d, win, false, e.SchemaVer)
 			return d, &RejectedError{Cause: market.CauseLateDropped, Detail: d.Detail}
 		}
 		if a.cfg.latePolicy == market.PolicyReject {
 			d.Reason = market.CauseLateDropped
 			d.Detail = "late event rejected by policy"
-			a.remember(d, win, false)
+			a.remember(d, win, false, e.SchemaVer)
 			return d, &RejectedError{Cause: market.CauseLateDropped, Detail: d.Detail}
 		}
 		// PolicyDrop + window still open + within allowed lateness: count it
@@ -188,22 +212,23 @@ func (a *Aggregator) Submit(e market.Event) (market.Decision, error) {
 		a.side = append(a.side, e)
 		d.Accepted = true
 		d.Detail = "late but window still open; counted and side-output"
-		a.remember(d, win, true)
+		a.remember(d, win, true, e.SchemaVer)
 		return d, nil
 	}
 
 	// On-time (possibly out-of-order within open windows): simply count it.
 	a.addToWindow(win, e)
 	d.Accepted = true
-	a.remember(d, win, false)
+	a.remember(d, win, false, e.SchemaVer)
 	return d, nil
 }
 
 // remember records the first verdict for an event id so retried delivery can
 // reproduce it. Must be called with a.mu held.
-func (a *Aggregator) remember(d market.Decision, win market.Window, late bool) {
+func (a *Aggregator) remember(d market.Decision, win market.Window, late bool, version int) {
 	a.seen[d.EventID] = seenEvent{
 		fp:      d.ContentFP,
+		version: version,
 		window:  win,
 		late:    late,
 		decided: d,

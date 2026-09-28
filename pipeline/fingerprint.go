@@ -32,10 +32,16 @@ func newEventBody(e market.Event) eventBody {
 	}
 }
 
-// ContentFingerprint returns a deterministic digest of an event's *content*.
-// The logical identity (EventID) is deliberately excluded: repeated delivery
-// of the same logical event must produce the same fingerprint, while the same
-// id with conflicting content produces a different one.
+// ContentFingerprint returns a deterministic digest of an event's RAW wire
+// content. The logical identity (EventID) is deliberately excluded, but the
+// declared schema version and all carried fields are included, so this digest
+// distinguishes different encodings of the same logical event.
+//
+// Deduplication during a gray schema rollout instead uses
+// Registry.DedupFingerprint, which strips the version label, normalizes the
+// int64->float64 widening and treats default-valued optional fields as
+// absent; ContentFingerprint remains available as the raw-content audit
+// digest.
 //
 // Canonical encoding relies on JSON scalar payloads and encoding/json's
 // sorted map keys, so identical content always yields the same digest.

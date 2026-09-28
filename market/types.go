@@ -30,6 +30,10 @@ const (
 	CauseSchemaVersionGap        RejectCause = "schema_version_gap"
 	CauseSchemaVersionRegressed  RejectCause = "schema_version_regressed"
 	CauseSchemaEmpty             RejectCause = "schema_empty"
+	// CauseSchemaNoSafeDefault rejects a gray-rollout upgrade whose NEW fields
+	// carry no declared safe default: existing events could not be rebuilt
+	// under the new version, so the upgrade is refused before it takes effect.
+	CauseSchemaNoSafeDefault RejectCause = "schema_no_safe_default"
 
 	// Deduplication causes.
 	CauseDuplicate RejectCause = "duplicate"

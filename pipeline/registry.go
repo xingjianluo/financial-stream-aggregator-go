@@ -9,9 +9,18 @@ import (
 )
 
 // FieldSpec describes one field of a schema version.
+//
+// A field is OPTIONAL iff it declares a default (HasDefault=true): events that
+// omit it are valid and are backfilled with Default when they are read or
+// rebuilt under a newer schema version. A field without a default stays
+// required, exactly as before the gray-rollout layer existed.
 type FieldSpec struct {
 	Name string          `json:"name"`
 	Type market.TypeKind `json:"type"`
+	// HasDefault marks the field optional and Default as its declared
+	// backfill value. Default must match Type when HasDefault is set.
+	HasDefault bool `json:"has_default,omitempty"`
+	Default    any  `json:"default,omitempty"`
 }
 
 // Schema is one numbered, immutable revision of the event structure.
@@ -47,12 +56,12 @@ const (
 var CoreSchemaV1 = Schema{
 	Version: 1,
 	Fields: []FieldSpec{
-		{FieldEventID, market.TypeString},
-		{FieldSymbol, market.TypeString},
-		{FieldEventTime, market.TypeInt64},
-		{FieldPrice, market.TypeInt64},
-		{FieldQuantity, market.TypeInt64},
-		{FieldIsTrade, market.TypeBool},
+		{Name: FieldEventID, Type: market.TypeString},
+		{Name: FieldSymbol, Type: market.TypeString},
+		{Name: FieldEventTime, Type: market.TypeInt64},
+		{Name: FieldPrice, Type: market.TypeInt64},
+		{Name: FieldQuantity, Type: market.TypeInt64},
+		{Name: FieldIsTrade, Type: market.TypeBool},
 	},
 }
 
@@ -84,6 +93,21 @@ func NewRegistry() *Registry {
 //   - the only allowed type change is the widening int64 -> float64; any
 //     narrowing or cross-kind change is rejected (schema_type_incompatible).
 func (r *Registry) Register(s Schema) (*CompatReport, error) {
+	return r.register(s, false)
+}
+
+// RegisterUpgrade registers a new schema version under the additional
+// GRAY-ROLLOUT rule: every field the new version ADDS must declare a safe
+// default (FieldSpec.HasDefault with a type-matching Default). An upgrade
+// whose new fields have no safe default would invalidate or make
+// un-rebuildable the events that already exist, so it is refused BEFORE it
+// takes effect with the distinguishable cause schema_no_safe_default —
+// never allowed through to fail later at runtime.
+func (r *Registry) RegisterUpgrade(s Schema) (*CompatReport, error) {
+	return r.register(s, true)
+}
+
+func (r *Registry) register(s Schema, grayRollout bool) (*CompatReport, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -95,6 +119,15 @@ func (r *Registry) Register(s Schema) (*CompatReport, error) {
 		return r.bad(s.Version, s.Version, market.CauseSchemaEmpty, dup, "", "",
 				"duplicate field name in schema"), &RejectedError{Cause: market.CauseSchemaEmpty,
 				Detail: "duplicate field: " + dup}
+	}
+	// A declared default must be a value of the declared type; a malformed
+	// default would make every later backfill non-deterministic garbage.
+	if f := badDefault(s.Fields); f != nil {
+		detail := fmt.Sprintf("field %q: default value does not match declared type %s",
+			f.Name, f.Type)
+		return r.bad(s.Version, s.Version, market.CauseSchemaFieldTypeMismatch,
+				f.Name, f.Type, "", detail),
+			&RejectedError{Cause: market.CauseSchemaFieldTypeMismatch, Detail: detail}
 	}
 
 	if len(r.schemas) == 0 {
@@ -139,9 +172,55 @@ func (r *Registry) Register(s Schema) (*CompatReport, error) {
 	if rep, err := checkEvolution(prev, s); err != nil {
 		return rep, err
 	}
+	if grayRollout {
+		if rep, err := checkGrayDefaults(prev, s); err != nil {
+			return rep, err
+		}
+	}
 
 	r.schemas[s.Version] = s
 	return &CompatReport{OK: true, From: latest, To: s.Version}, nil
+}
+
+// checkGrayDefaults enforces the gray-rollout rule: every field ADDED by the
+// new version must be optional with a declared, type-matching safe default.
+func checkGrayDefaults(prev, s Schema) (*CompatReport, error) {
+	old := make(map[string]struct{}, len(prev.Fields))
+	for _, f := range prev.Fields {
+		old[f.Name] = struct{}{}
+	}
+	for _, f := range s.Fields {
+		if _, existed := old[f.Name]; existed {
+			continue
+		}
+		if !f.HasDefault {
+			detail := fmt.Sprintf(
+				"new field %q has no safe default; existing events could not be rebuilt under v%d",
+				f.Name, s.Version)
+			rep := &CompatReport{OK: false, From: prev.Version, To: s.Version,
+				Reason: market.CauseSchemaNoSafeDefault, Field: f.Name,
+				FromType: f.Type, Detail: detail}
+			return rep, &RejectedError{Cause: market.CauseSchemaNoSafeDefault,
+				Detail: detail}
+		}
+	}
+	return nil, nil
+}
+
+// Clone returns a deep, independent copy of the registry. It backs read-only
+// dry-run previews: a proposed upgrade is rehearsed on the clone while the
+// online registry stays untouched.
+func (r *Registry) Clone() *Registry {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := &Registry{schemas: make(map[int]Schema, len(r.schemas))}
+	for v, s := range r.schemas {
+		fs := make([]FieldSpec, len(s.Fields))
+		copy(fs, s.Fields)
+		s.Fields = fs
+		out.schemas[v] = s
+	}
+	return out
 }
 
 // Get returns the schema with the given version.
@@ -184,6 +263,12 @@ func (r *Registry) Validate(e market.Event) (market.RejectCause, string) {
 	for _, f := range s.Fields {
 		v, present := fieldValue(e, f.Name)
 		if !present || v == nil {
+			// Optional fields (declared default) may be absent on the wire;
+			// they are deterministically backfilled at read/rebuild time
+			// (see Canonicalize), so old events never fail as incomplete.
+			if f.HasDefault {
+				continue
+			}
 			return market.CauseSchemaMissingField,
 				fmt.Sprintf("field %q required by schema v%d is absent", f.Name, s.Version)
 		}
@@ -256,16 +341,55 @@ func schemaEqual(a, b Schema) bool {
 		return false
 	}
 	// Registration preserves order, but compare as sets to be order-agnostic.
-	am := make(map[string]market.TypeKind, len(a.Fields))
+	am := make(map[string]FieldSpec, len(a.Fields))
 	for _, f := range a.Fields {
-		am[f.Name] = f.Type
+		am[f.Name] = f
 	}
 	for _, f := range b.Fields {
-		if am[f.Name] != f.Type {
+		g, ok := am[f.Name]
+		if !ok || g.Type != f.Type || g.HasDefault != f.HasDefault {
+			return false
+		}
+		if g.HasDefault && !defaultValueEqual(g.Default, g.Type, f.Default) {
 			return false
 		}
 	}
 	return true
+}
+
+// defaultValueEqual compares a stored default with a candidate default under
+// the field's declared type, applying the same numeric-widening transparency
+// as valueMatchesType (an int64 default equals the integral float64 one).
+func defaultValueEqual(stored any, k market.TypeKind, candidate any) bool {
+	if k == market.TypeFloat64 {
+		sf, sok := numericAsFloat(stored)
+		cf, cok := numericAsFloat(candidate)
+		return sok && cok && sf == cf
+	}
+	return stored == candidate
+}
+
+// numericAsFloat reads an int64/float64 payload as float64.
+func numericAsFloat(v any) (float64, bool) {
+	switch n := v.(type) {
+	case int64:
+		return float64(n), true
+	case float64:
+		return n, true
+	}
+	return 0, false
+}
+
+// badDefault returns the first field whose declared default does not match
+// its declared type, or nil.
+func badDefault(fs []FieldSpec) *FieldSpec {
+	for i := range fs {
+		f := &fs[i]
+		if f.HasDefault && !valueMatchesType(f.Default, f.Type) {
+			return f
+		}
+	}
+	return nil
 }
 
 func duplicateFieldName(fs []FieldSpec) string {
