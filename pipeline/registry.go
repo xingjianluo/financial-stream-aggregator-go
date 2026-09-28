@@ -1,7 +1,11 @@
 package pipeline
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
+	"reflect"
 	"sort"
 	"sync"
 
@@ -9,9 +13,17 @@ import (
 )
 
 // FieldSpec describes one field of a schema version.
+//
+// HasDefault/Default declare an OPTIONAL field with an explicit safe default:
+// an event whose own (older) schema does not carry the field can be read or
+// rebuilt under this version by filling Default. A gray-upgrade schema may
+// only ADD fields that carry such a default; adding a field without one is
+// rejected before the upgrade takes effect.
 type FieldSpec struct {
-	Name string          `json:"name"`
-	Type market.TypeKind `json:"type"`
+	Name       string          `json:"name"`
+	Type       market.TypeKind `json:"type"`
+	HasDefault bool            `json:"has_default,omitempty"`
+	Default    any             `json:"default,omitempty"`
 }
 
 // Schema is one numbered, immutable revision of the event structure.
@@ -47,12 +59,12 @@ const (
 var CoreSchemaV1 = Schema{
 	Version: 1,
 	Fields: []FieldSpec{
-		{FieldEventID, market.TypeString},
-		{FieldSymbol, market.TypeString},
-		{FieldEventTime, market.TypeInt64},
-		{FieldPrice, market.TypeInt64},
-		{FieldQuantity, market.TypeInt64},
-		{FieldIsTrade, market.TypeBool},
+		{Name: FieldEventID, Type: market.TypeString},
+		{Name: FieldSymbol, Type: market.TypeString},
+		{Name: FieldEventTime, Type: market.TypeInt64},
+		{Name: FieldPrice, Type: market.TypeInt64},
+		{Name: FieldQuantity, Type: market.TypeInt64},
+		{Name: FieldIsTrade, Type: market.TypeBool},
 	},
 }
 
@@ -87,14 +99,8 @@ func (r *Registry) Register(s Schema) (*CompatReport, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	if len(s.Fields) == 0 {
-		return r.bad(s.Version, s.Version, market.CauseSchemaEmpty, "", "", "",
-			"schema declares no fields"), &RejectedError{Cause: market.CauseSchemaEmpty}
-	}
-	if dup := duplicateFieldName(s.Fields); dup != "" {
-		return r.bad(s.Version, s.Version, market.CauseSchemaEmpty, dup, "", "",
-				"duplicate field name in schema"), &RejectedError{Cause: market.CauseSchemaEmpty,
-				Detail: "duplicate field: " + dup}
+	if rep, err := r.validateCandidateLocked(s); err != nil {
+		return rep, err
 	}
 
 	if len(r.schemas) == 0 {
@@ -175,7 +181,14 @@ func (r *Registry) Validate(e market.Event) (market.RejectCause, string) {
 		return market.CauseSchemaUnknownVersion,
 			fmt.Sprintf("schema version %d is not registered", e.SchemaVer)
 	}
+	return validateAgainst(e, s)
+}
 
+// validateAgainst checks an event against an explicit schema. Events are
+// ALWAYS checked against their own version during live processing, which is
+// what makes replaying historical data reproduce the first conclusion; the
+// dry-run uses the candidate schema before it is registered.
+func validateAgainst(e market.Event, s Schema) (market.RejectCause, string) {
 	declared := make(map[string]market.TypeKind, len(s.Fields))
 	for _, f := range s.Fields {
 		declared[f.Name] = f.Type
@@ -184,6 +197,12 @@ func (r *Registry) Validate(e market.Event) (market.RejectCause, string) {
 	for _, f := range s.Fields {
 		v, present := fieldValue(e, f.Name)
 		if !present || v == nil {
+			// An optional field with a declared safe default may be absent:
+			// the read side fills it, so an old/partial payload is not a
+			// structurally incomplete event.
+			if f.HasDefault {
+				continue
+			}
 			return market.CauseSchemaMissingField,
 				fmt.Sprintf("field %q required by schema v%d is absent", f.Name, s.Version)
 		}
@@ -251,17 +270,129 @@ func checkEvolution(prev, s Schema) (*CompatReport, error) {
 	return nil, nil
 }
 
+// CommitUpgrade enables a candidate schema as the next version under the
+// GRAY-UPGRADE safety rules. It performs every plain Register compatibility
+// check and additionally requires every newly added field to carry a safe
+// default: otherwise old producers' events would become structurally
+// incomplete the moment the upgrade takes effect. The upgrade is refused
+// BEFORE it can invalidate existing events (cause
+// schema_added_field_without_default), distinct from all other structural
+// causes.
+//
+// Re-registering an already-present, identical version is idempotent, exactly
+// like Register, so replaying the commit history is reproducible.
+func (r *Registry) CommitUpgrade(s Schema) (*CompatReport, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if rep, err := r.validateCandidateLocked(s); err != nil {
+		return rep, err
+	}
+	if len(r.schemas) == 0 {
+		if s.Version != 1 {
+			return r.bad(0, s.Version, market.CauseSchemaVersionGap, "", "", "",
+					"first schema must be version 1"),
+				&RejectedError{Cause: market.CauseSchemaVersionGap}
+		}
+		r.schemas[1] = s
+		return &CompatReport{OK: true, From: 0, To: 1}, nil
+	}
+
+	latest := r.latestVersionLocked()
+	if existing, ok := r.schemas[s.Version]; ok {
+		if schemaEqual(existing, s) {
+			return &CompatReport{OK: true, From: s.Version, To: s.Version,
+				Detail: "identical schema already registered"}, nil
+		}
+		return r.bad(s.Version, s.Version, market.CauseSchemaDuplicateVersion, "", "", "",
+				"schema version already registered with a different body"),
+			&RejectedError{Cause: market.CauseSchemaDuplicateVersion}
+	}
+	if s.Version < latest {
+		return r.bad(latest, s.Version, market.CauseSchemaVersionRegressed, "", "", "",
+				fmt.Sprintf("version %d is below latest %d", s.Version, latest)),
+			&RejectedError{Cause: market.CauseSchemaVersionRegressed}
+	}
+	if s.Version != latest+1 {
+		return r.bad(latest, s.Version, market.CauseSchemaVersionGap, "", "", "",
+				fmt.Sprintf("expected version %d, got %d", latest+1, s.Version)),
+			&RejectedError{Cause: market.CauseSchemaVersionGap}
+	}
+
+	prev := r.schemas[latest]
+	if rep, err := checkEvolution(prev, s); err != nil {
+		return rep, err
+	}
+	if rep, err := checkGraySafety(prev, s); err != nil {
+		return rep, err
+	}
+	r.schemas[s.Version] = s
+	return &CompatReport{OK: true, From: latest, To: s.Version}, nil
+}
+
+// validateCandidateLocked runs the version-independent body checks shared by
+// Register and CommitUpgrade.
+func (r *Registry) validateCandidateLocked(s Schema) (*CompatReport, error) {
+	if len(s.Fields) == 0 {
+		return r.bad(s.Version, s.Version, market.CauseSchemaEmpty, "", "", "",
+			"schema declares no fields"), &RejectedError{Cause: market.CauseSchemaEmpty}
+	}
+	if dup := duplicateFieldName(s.Fields); dup != "" {
+		return r.bad(s.Version, s.Version, market.CauseSchemaEmpty, dup, "", "",
+				"duplicate field name in schema"), &RejectedError{Cause: market.CauseSchemaEmpty,
+				Detail: "duplicate field: " + dup}
+	}
+	for _, f := range s.Fields {
+		if f.HasDefault && !valueMatchesType(f.Default, f.Type) {
+			return r.bad(s.Version, s.Version,
+					market.CauseSchemaDefaultTypeMismatch, f.Name, f.Type, f.Type,
+					fmt.Sprintf("default value %v does not match type %s", f.Default, f.Type)),
+				&RejectedError{Cause: market.CauseSchemaDefaultTypeMismatch,
+					Detail: fmt.Sprintf("field %s default %v is not %s", f.Name, f.Default, f.Type)}
+		}
+	}
+	return nil, nil
+}
+
+// checkGraySafety enforces the gray-upgrade-only rule: any field added by the
+// new version MUST be optional with a declared safe default.
+func checkGraySafety(prev, s Schema) (*CompatReport, error) {
+	old := make(map[string]FieldSpec, len(prev.Fields))
+	for _, f := range prev.Fields {
+		old[f.Name] = f
+	}
+	for _, f := range s.Fields {
+		if _, existed := old[f.Name]; existed {
+			continue
+		}
+		if !f.HasDefault {
+			rep := &CompatReport{OK: false, From: prev.Version, To: s.Version,
+				Reason: market.CauseSchemaAddedFieldNoDefault, Field: f.Name,
+				ToType: f.Type,
+				Detail: "newly added field has no safe default; existing events would become invalid"}
+			return rep, &RejectedError{Cause: market.CauseSchemaAddedFieldNoDefault,
+				Detail: "field added without a default: " + f.Name}
+		}
+	}
+	return nil, nil
+}
+
 func schemaEqual(a, b Schema) bool {
 	if a.Version != b.Version || len(a.Fields) != len(b.Fields) {
 		return false
 	}
 	// Registration preserves order, but compare as sets to be order-agnostic.
-	am := make(map[string]market.TypeKind, len(a.Fields))
+	am := make(map[string]FieldSpec, len(a.Fields))
 	for _, f := range a.Fields {
-		am[f.Name] = f.Type
+		am[f.Name] = f
 	}
 	for _, f := range b.Fields {
-		if am[f.Name] != f.Type {
+		af, ok := am[f.Name]
+		if !ok {
+			return false
+		}
+		if af.Type != f.Type || af.HasDefault != f.HasDefault ||
+			!reflect.DeepEqual(af.Default, f.Default) {
 			return false
 		}
 	}
@@ -280,7 +411,18 @@ func duplicateFieldName(fs []FieldSpec) string {
 }
 
 // fieldValue resolves a declared field name on an event.
+//
+// A value carried in Event.Fields takes precedence over the fixed struct
+// slots: when a numeric core field (e.g. quantity) is widened to float64 in a
+// later schema, the new-version producer has no int64 struct slot to put the
+// widened value in and therefore delivers it through Fields. Old events leave
+// Fields empty and read from the struct slots as before.
 func fieldValue(e market.Event, name string) (any, bool) {
+	if e.Fields != nil {
+		if v, ok := e.Fields[name]; ok && v != nil {
+			return v, true
+		}
+	}
 	switch name {
 	case FieldEventID:
 		return e.EventID, e.EventID != ""
@@ -295,8 +437,7 @@ func fieldValue(e market.Event, name string) (any, bool) {
 	case FieldIsTrade:
 		return e.IsTrade, true
 	default:
-		v, ok := e.Fields[name]
-		return v, ok
+		return nil, false
 	}
 }
 
@@ -321,4 +462,113 @@ func valueMatchesType(v any, k market.TypeKind) bool {
 		return ok
 	}
 	return false
+}
+
+// projectEventTo fills absent optional fields of e with the defaults declared
+// by target, returning the rebuilt event plus the sorted list of field names
+// that were defaulted. It does NOT mutate the input.
+//
+// A present value that cannot be read under target's declared type (anything
+// other than the int64->float64 widening) is a per-data failure carrying a
+// distinguishable cause.
+func projectEventTo(e market.Event, target Schema) (market.Event, []string, market.RejectCause, string) {
+	out := e
+	if len(e.Fields) > 0 {
+		out.Fields = make(map[string]any, len(e.Fields))
+		for k, v := range e.Fields {
+			out.Fields[k] = v
+		}
+	}
+	defaulted := map[string]struct{}{}
+	for _, f := range target.Fields {
+		v, present := fieldValue(e, f.Name)
+		if !present || v == nil {
+			if !f.HasDefault {
+				return out, nil, market.CauseSchemaMissingField,
+					fmt.Sprintf("field %q has no value and no default under v%d", f.Name, target.Version)
+			}
+			if !isCoreField(f.Name) {
+				if out.Fields == nil {
+					out.Fields = make(map[string]any)
+				}
+				out.Fields[f.Name] = f.Default
+			}
+			defaulted[f.Name] = struct{}{}
+			continue
+		}
+		if !valueMatchesType(v, f.Type) {
+			return out, nil, market.CauseSchemaFieldTypeMismatch,
+				fmt.Sprintf("field %q: cannot read %T as %s under v%d", f.Name, v, f.Type, target.Version)
+		}
+	}
+	// Carried extras not declared by target stay as per-version extras; the
+	// source-version validation already guarantees no undeclared extras.
+	return out, sortedKeys(defaulted), market.CauseNone, ""
+}
+
+// semanticFP projects an event onto target (default filling) and then renders
+// every declared field through target's type, so the ONLY permitted type
+// change (int64 -> float64) collapses equal numeric magnitudes to the same
+// bytes. The schema version is intentionally excluded: same logical content
+// from the old and the new gray producer must hash identically, while a
+// genuine difference in price/quantity/a new field hashes differently.
+func semanticFP(e market.Event, target Schema) (string, []string, market.RejectCause, string) {
+	proj, defaulted, cause, detail := projectEventTo(e, target)
+	if cause != market.CauseNone {
+		return "", nil, cause, detail
+	}
+	canon := make(map[string]any, len(target.Fields))
+	for _, f := range target.Fields {
+		v, _ := fieldValue(proj, f.Name)
+		if f.Type == market.TypeFloat64 {
+			// Normalize int64 and float64 to the same numeric representation;
+			// JSON then renders equal magnitudes identically.
+			switch n := v.(type) {
+			case int64:
+				v = float64(n)
+			case float64:
+				v = n
+			}
+		}
+		canon[f.Name] = v
+	}
+	b, _ := json.Marshal(canon)
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])[:16], defaulted, market.CauseNone, ""
+}
+
+// SemanticFingerprint canonicalizes a validated event against the registry's
+// newest schema. It is the basis of cross-version dedup.
+func (r *Registry) SemanticFingerprint(e market.Event) (string, []string, bool) {
+	r.mu.RLock()
+	latest, ok := r.schemas[r.latestVersionLocked()]
+	r.mu.RUnlock()
+	if !ok {
+		return "", nil, false
+	}
+	fp, defaulted, cause, _ := semanticFP(e, latest)
+	if cause != market.CauseNone {
+		return "", nil, false
+	}
+	return fp, defaulted, true
+}
+
+func isCoreField(name string) bool {
+	switch name {
+	case FieldEventID, FieldSymbol, FieldEventTime, FieldPrice, FieldQuantity, FieldIsTrade:
+		return true
+	}
+	return false
+}
+
+func sortedKeys(m map[string]struct{}) []string {
+	if len(m) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }

@@ -5,7 +5,9 @@
 package pipeline
 
 import (
+	"fmt"
 	"sort"
+	"strconv"
 	"sync"
 
 	"github.com/xingjianluo/financial-stream-aggregator-go/market"
@@ -59,6 +61,10 @@ type seenEvent struct {
 	window  market.Window
 	late    bool
 	decided market.Decision
+	// first holds the first physical delivery, so a later delivery under a
+	// different schema version can be reconciled against it (default filling
+	// + numeric widening) rather than against a raw versioned fingerprint.
+	first market.Event
 }
 
 // Aggregator is a concurrency-safe local streaming aggregator. All state
@@ -131,6 +137,7 @@ func (a *Aggregator) Submit(e market.Event) (market.Decision, error) {
 		Window:    windowPtr(win),
 		ContentFP: fp,
 		Watermark: a.watermark,
+		SchemaVer: e.SchemaVer,
 	}
 
 	// 1. Structural validation against the event's own schema version.
@@ -140,24 +147,37 @@ func (a *Aggregator) Submit(e market.Event) (market.Decision, error) {
 		return d, &RejectedError{Cause: cause, Detail: detail}
 	}
 
-	// 2. Idempotent dedup / explicit conflict.
+	// 2. Idempotent dedup / explicit conflict, gray-upgrade aware.
+	//    - identical physical content (any version): idempotent duplicate;
+	//    - different version but semantically identical once new optional
+	//      fields take their declared defaults and int64->float64 widening
+	//      keeps the same numeric magnitude: cross-version duplicate, still
+	//      counted once and replaying the original verdict;
+	//    - different version with a real difference in price/quantity/a new
+	//      field: cross_version_conflict, a distinguishable rejection;
+	//    - same version, different content: conflict.
 	if prev, ok := a.seen[e.EventID]; ok {
-		d.Duplicate = true
-		if prev.fp != fp {
-			d.Reason = market.CauseConflict
-			d.Detail = "event_id " + e.EventID +
-				" already seen with different content"
-			return d, &RejectedError{Cause: market.CauseConflict, Detail: d.Detail}
+		switch a.classifyRepeated(prev, e, fp, &d) {
+		case repeatedSame:
+			replay := prev.decided
+			replay.Duplicate = true
+			replay.Watermark = a.watermark
+			replay.Window = windowPtr(prev.window)
+			replay.SchemaVer = e.SchemaVer
+			return replay, nil
+		case repeatedCrossVersion:
+			replay := prev.decided
+			replay.Duplicate = true
+			replay.CrossVersion = true
+			replay.MatchedVer = prev.first.SchemaVer
+			replay.Watermark = a.watermark
+			replay.Window = windowPtr(prev.window)
+			replay.SchemaVer = e.SchemaVer
+			replay.Defaulted = d.Defaulted
+			return replay, nil
+		case repeatedConflict:
+			return d, &RejectedError{Cause: d.Reason, Detail: d.Detail}
 		}
-		// Same content: replay the ORIGINAL verdict (same acceptance and
-		// reason, so retried delivery never changes any statistic), while
-		// flagging THIS delivery as a duplicate and reporting the now-current
-		// watermark for auditability.
-		replay := prev.decided
-		replay.Duplicate = true
-		replay.Watermark = a.watermark
-		replay.Window = windowPtr(prev.window)
-		return replay, nil
 	}
 
 	// 3. Event-time classification.
@@ -167,19 +187,19 @@ func (a *Aggregator) Submit(e market.Event) (market.Decision, error) {
 			// Its window is already sealed: results are immutable.
 			d.Reason = market.CauseWindowSealed
 			d.Detail = "window is sealed by watermark; late event rejected"
-			a.remember(d, win, false)
+			a.remember(d, win, false, e)
 			return d, &RejectedError{Cause: market.CauseWindowSealed, Detail: d.Detail}
 		}
 		if a.watermark-e.EventTime > a.cfg.allowedLateMs {
 			d.Reason = market.CauseLateDropped
 			d.Detail = "lateness exceeds allowed lateness"
-			a.remember(d, win, false)
+			a.remember(d, win, false, e)
 			return d, &RejectedError{Cause: market.CauseLateDropped, Detail: d.Detail}
 		}
 		if a.cfg.latePolicy == market.PolicyReject {
 			d.Reason = market.CauseLateDropped
 			d.Detail = "late event rejected by policy"
-			a.remember(d, win, false)
+			a.remember(d, win, false, e)
 			return d, &RejectedError{Cause: market.CauseLateDropped, Detail: d.Detail}
 		}
 		// PolicyDrop + window still open + within allowed lateness: count it
@@ -188,26 +208,103 @@ func (a *Aggregator) Submit(e market.Event) (market.Decision, error) {
 		a.side = append(a.side, e)
 		d.Accepted = true
 		d.Detail = "late but window still open; counted and side-output"
-		a.remember(d, win, true)
+		a.remember(d, win, true, e)
 		return d, nil
 	}
 
 	// On-time (possibly out-of-order within open windows): simply count it.
 	a.addToWindow(win, e)
 	d.Accepted = true
-	a.remember(d, win, false)
+	a.remember(d, win, false, e)
 	return d, nil
 }
 
 // remember records the first verdict for an event id so retried delivery can
 // reproduce it. Must be called with a.mu held.
-func (a *Aggregator) remember(d market.Decision, win market.Window, late bool) {
+func (a *Aggregator) remember(d market.Decision, win market.Window, late bool, e market.Event) {
 	a.seen[d.EventID] = seenEvent{
 		fp:      d.ContentFP,
 		window:  win,
 		late:    late,
 		decided: d,
+		first:   e,
 	}
+}
+
+// repeatedKind is the outcome of comparing a re-delivered id with its first
+// delivery under the gray-upgrade reconciliation rules.
+type repeatedKind int
+
+const (
+	repeatedSame repeatedKind = iota
+	repeatedCrossVersion
+	repeatedConflict
+)
+
+// classifyRepeated decides whether a repeated delivery is the same logical
+// event, a cross-version-compatible re-delivery, or a real conflict. It fills
+// d.Duplicate/d.Reason/d.Detail/d.Defaulted as appropriate.
+func (a *Aggregator) classifyRepeated(prev seenEvent, e market.Event, fp string, d *market.Decision) repeatedKind {
+	if prev.fp == fp {
+		// Same version, byte-identical content: the original idempotent path.
+		d.Duplicate = true
+		return repeatedSame
+	}
+	if e.SchemaVer == prev.first.SchemaVer {
+		// Same version, different content: never silently overwrite.
+		d.Duplicate = true
+		d.Reason = market.CauseConflict
+		d.Detail = "event_id " + e.EventID +
+			" already seen with different content under schema v" +
+			strconv.Itoa(e.SchemaVer)
+		return repeatedConflict
+	}
+
+	// Cross-version: canonicalize both sides onto the registry's newest
+	// schema. Default filling and the int64->float64 widening are transparent
+	// there; any remaining difference is a genuine value conflict.
+	fpNew, defNew, okNew := a.reg.SemanticFingerprint(e)
+	fpOld, defOld, okOld := a.reg.SemanticFingerprint(prev.first)
+	if !okNew || !okOld {
+		d.Duplicate = true
+		d.Reason = market.CauseCrossVersionConflict
+		d.Detail = fmt.Sprintf("event_id %s v%d vs v%d cannot be reconciled: "+
+			"a field lacks a safe default under the newest schema",
+			e.EventID, prev.first.SchemaVer, e.SchemaVer)
+		return repeatedConflict
+	}
+	if fpNew == fpOld {
+		d.Duplicate = true
+		d.Defaulted = mergeDefaulted(defOld, defNew)
+		d.Detail = fmt.Sprintf("cross-version duplicate: v%d equivalent to v%d "+
+			"after default filling and numeric widening",
+			e.SchemaVer, prev.first.SchemaVer)
+		return repeatedCrossVersion
+	}
+	d.Duplicate = true
+	d.Reason = market.CauseCrossVersionConflict
+	d.Detail = fmt.Sprintf("event_id %s v%d vs v%d differs in price/quantity/new-field "+
+		"values after defaults are applied", e.EventID,
+		prev.first.SchemaVer, e.SchemaVer)
+	return repeatedConflict
+}
+
+// mergeDefaulted unions the defaulted field names reported for the two
+// deliveries, deduplicated and sorted, for a stable audit trail.
+func mergeDefaulted(a, b []string) []string {
+	set := make(map[string]struct{}, len(a)+len(b))
+	for _, s := range a {
+		set[s] = struct{}{}
+	}
+	for _, s := range b {
+		set[s] = struct{}{}
+	}
+	out := make([]string, 0, len(set))
+	for s := range set {
+		out = append(out, s)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // addToWindow folds one accepted event into its open window.

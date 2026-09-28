@@ -30,10 +30,20 @@ const (
 	CauseSchemaVersionGap        RejectCause = "schema_version_gap"
 	CauseSchemaVersionRegressed  RejectCause = "schema_version_regressed"
 	CauseSchemaEmpty             RejectCause = "schema_empty"
+	// Gray-upgrade-specific structural causes.
+	CauseSchemaAddedFieldNoDefault RejectCause = "schema_added_field_without_default"
+	CauseSchemaDefaultTypeMismatch RejectCause = "schema_default_type_mismatch"
 
 	// Deduplication causes.
 	CauseDuplicate RejectCause = "duplicate"
 	CauseConflict  RejectCause = "conflict"
+	// CauseCrossVersionConflict means the same logical id arrived from the two
+	// gray-upgrade producers under different schema versions, and even after
+	// default filling and numeric-widening normalization the payloads disagree
+	// in price/quantity/new-field values. It is deliberately distinct from
+	// CauseConflict (same-version disagreement) and from a cross-version
+	// duplicate (a compatible re-delivery, Duplicate=true).
+	CauseCrossVersionConflict RejectCause = "cross_version_conflict"
 
 	// Lateness / window lifecycle causes.
 	CauseWindowSealed RejectCause = "window_sealed"
@@ -106,4 +116,16 @@ type Decision struct {
 	Duplicate bool        `json:"duplicate"`
 	ContentFP string      `json:"content_fp"`
 	Detail    string      `json:"detail,omitempty"`
+
+	// SchemaVer is the schema version declared by THIS delivery.
+	SchemaVer int `json:"schema_ver,omitempty"`
+	// CrossVersion marks a duplicate that arrived under a different schema
+	// version than the first delivery of the same logical id.
+	CrossVersion bool `json:"cross_version,omitempty"`
+	// MatchedVer is the first delivery's schema version for a cross-version
+	// duplicate; zero otherwise.
+	MatchedVer int `json:"matched_ver,omitempty"`
+	// Defaulted lists optional fields that were filled from their declared
+	// defaults when the two gray producers were reconciled (audit trail).
+	Defaulted []string `json:"defaulted,omitempty"`
 }

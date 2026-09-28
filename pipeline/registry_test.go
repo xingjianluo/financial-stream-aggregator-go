@@ -28,13 +28,13 @@ func TestRegistryEvolution(t *testing.T) {
 	t.Logf("[schema] v1->v2 add field venue: ok")
 
 	v3 := Schema{Version: 3, Fields: []FieldSpec{
-		{FieldEventID, market.TypeString},
-		{FieldSymbol, market.TypeString},
-		{FieldEventTime, market.TypeInt64},
-		{FieldPrice, market.TypeFloat64}, // widened
-		{FieldQuantity, market.TypeInt64},
-		{FieldIsTrade, market.TypeBool},
-		{"venue", market.TypeString},
+		{Name: FieldEventID, Type: market.TypeString},
+		{Name: FieldSymbol, Type: market.TypeString},
+		{Name: FieldEventTime, Type: market.TypeInt64},
+		{Name: FieldPrice, Type: market.TypeFloat64}, // widened
+		{Name: FieldQuantity, Type: market.TypeInt64},
+		{Name: FieldIsTrade, Type: market.TypeBool},
+		{Name: "venue", Type: market.TypeString},
 	}}
 	if rep, err := r.Register(v3); err != nil || !rep.OK {
 		t.Fatalf("register v3 (widen price): rep=%+v err=%v", rep, err)
@@ -43,12 +43,12 @@ func TestRegistryEvolution(t *testing.T) {
 
 	// Remove a field.
 	v4Removed := Schema{Version: 4, Fields: []FieldSpec{
-		{FieldEventID, market.TypeString},
-		{FieldSymbol, market.TypeString},
-		{FieldEventTime, market.TypeInt64},
-		{FieldPrice, market.TypeFloat64},
-		{FieldQuantity, market.TypeInt64},
-		{FieldIsTrade, market.TypeBool},
+		{Name: FieldEventID, Type: market.TypeString},
+		{Name: FieldSymbol, Type: market.TypeString},
+		{Name: FieldEventTime, Type: market.TypeInt64},
+		{Name: FieldPrice, Type: market.TypeFloat64},
+		{Name: FieldQuantity, Type: market.TypeInt64},
+		{Name: FieldIsTrade, Type: market.TypeBool},
 		// venue dropped
 	}}
 	rep, err := r.Register(v4Removed)
@@ -59,13 +59,13 @@ func TestRegistryEvolution(t *testing.T) {
 
 	// Narrow a type (float64 -> int64).
 	v4Narrow := Schema{Version: 4, Fields: []FieldSpec{
-		{FieldEventID, market.TypeString},
-		{FieldSymbol, market.TypeString},
-		{FieldEventTime, market.TypeInt64},
-		{FieldPrice, market.TypeInt64}, // narrowed
-		{FieldQuantity, market.TypeInt64},
-		{FieldIsTrade, market.TypeBool},
-		{"venue", market.TypeString},
+		{Name: FieldEventID, Type: market.TypeString},
+		{Name: FieldSymbol, Type: market.TypeString},
+		{Name: FieldEventTime, Type: market.TypeInt64},
+		{Name: FieldPrice, Type: market.TypeInt64}, // narrowed
+		{Name: FieldQuantity, Type: market.TypeInt64},
+		{Name: FieldIsTrade, Type: market.TypeBool},
+		{Name: "venue", Type: market.TypeString},
 	}}
 	rep, err = r.Register(v4Narrow)
 	if err == nil || rep.OK || rep.Reason != market.CauseSchemaTypeIncompatible || rep.Field != "price" {
@@ -76,13 +76,13 @@ func TestRegistryEvolution(t *testing.T) {
 
 	// Cross-kind change (string -> int64 on symbol).
 	v4Cross := Schema{Version: 4, Fields: []FieldSpec{
-		{FieldEventID, market.TypeString},
-		{FieldSymbol, market.TypeInt64},
-		{FieldEventTime, market.TypeInt64},
-		{FieldPrice, market.TypeFloat64},
-		{FieldQuantity, market.TypeInt64},
-		{FieldIsTrade, market.TypeBool},
-		{"venue", market.TypeString},
+		{Name: FieldEventID, Type: market.TypeString},
+		{Name: FieldSymbol, Type: market.TypeInt64},
+		{Name: FieldEventTime, Type: market.TypeInt64},
+		{Name: FieldPrice, Type: market.TypeFloat64},
+		{Name: FieldQuantity, Type: market.TypeInt64},
+		{Name: FieldIsTrade, Type: market.TypeBool},
+		{Name: "venue", Type: market.TypeString},
 	}}
 	rep, err = r.Register(v4Cross)
 	if err == nil || rep.Reason != market.CauseSchemaTypeIncompatible {
@@ -112,13 +112,13 @@ func TestRegistryEvolution(t *testing.T) {
 	t.Log("[schema] identical replay of v1: idempotent ok")
 
 	v2Mutated := Schema{Version: 2, Fields: []FieldSpec{
-		{FieldEventID, market.TypeString},
-		{FieldSymbol, market.TypeString},
-		{FieldEventTime, market.TypeInt64},
-		{FieldPrice, market.TypeInt64},
-		{FieldQuantity, market.TypeInt64},
-		{FieldIsTrade, market.TypeBool},
-		{"venue", market.TypeBool}, // different type
+		{Name: FieldEventID, Type: market.TypeString},
+		{Name: FieldSymbol, Type: market.TypeString},
+		{Name: FieldEventTime, Type: market.TypeInt64},
+		{Name: FieldPrice, Type: market.TypeInt64},
+		{Name: FieldQuantity, Type: market.TypeInt64},
+		{Name: FieldIsTrade, Type: market.TypeBool},
+		{Name: "venue", Type: market.TypeBool}, // different type
 	}}
 	rep, err = r.Register(v2Mutated)
 	if err == nil || rep.Reason != market.CauseSchemaDuplicateVersion {
